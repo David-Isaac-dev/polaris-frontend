@@ -191,25 +191,75 @@ async function getContractSpec(
 }
 
 /**
- * Runs a market/perpetual contract call authorized by the stored wallet.
+ * Runs a market/perpetual contract call authored by the connected wallet.
  *
- * - `'freighter'`: builds, simulates, and signs the transaction directly
- *   against Soroban RPC — the contract's real interface is fetched from the
- *   network once per WASM hash and cached (no bundled wasm/spec needed),
- *   and Freighter's own `signTransaction` plugs in as the client's signer
- *   as-is (the SDK's `Signer` type is documented to match it exactly). No
- *   backend relay, no sponsored fee — the connected wallet pays its own,
- *   same as any other Soroban dapp.
- * - `'email'`: unchanged — a single call to `/auth/email/trade`, which
- *   signs with the session's server-held custodial key (see
- *   `EmailAuthService`) via the same WebAuthn-shaped smart-wallet
- *   `__check_auth` the (now-removed) passkey path used.
+ * The transaction is assembled and signed client-side (Freighter), then
+ * submitted through the backend's relay so the app never needs to hold the
+ * user's secret. Returns the transaction hash so callers can render a
+ * "Confirmed — ref …" reference.
+ *
+ * A missing hash is treated as a hard error rather than an empty string: if
+ * neither response shape carries a hash (SDK version drift, an unexpected
+ * send path), the UI would otherwise claim "Confirmed" with a blank ref and
+ * no way to look the transaction up. Throwing forces the caller to surface a
+ * real failure instead of a false success.
  */
 export async function callAsWallet(
-  wallet: StoredWallet,
   contractId: string,
-  functionName: TradeFunction,
-  args: Record<string, string | number>,
-  c
+  fn: TradeFunction,
+  args: Record<string, unknown>,
+  address: string,
+): Promise<string> {
+  const { contract, TransactionBuilder, Networks, BASE_FEE, nativeToScVal, Address } = await import(
+    '@stellar/stellar-sdk'
+  );
+  const spec = await getContractSpec(contractId, config.rpcUrl, config.stellarNetworkPassphrase);
+  const client = new contract.Client(spec, {
+    contractId,
+    rpcUrl: config.rpcUrl,
+    networkPassphrase: config.stellarNetworkPassphrase,
+  });
 
-/* … truncated 2052 chars — edit only what you need near the top … */
+  const wireArgs: Record<string, unknown> = { ...args };
+  for (const field of I128_FIELDS) {
+    if (field in wireArgs) {
+      wireArgs[field] = nativeToScVal(wireArgs[field], { type: 'i128' });
+    }
+  }
+  if (PREDICTION_FIELD in wireArgs) {
+    wireArgs[PREDICTION_FIELD] = predictionScVal(String(wireArgs[PREDICTION_FIELD]));
+  }
+  wireArgs[AUTH_ADDRESS_PARAM] = new Address(address).toScVal();
+
+  const tradeContract = client as unknown as TradeContract;
+  const assembled = await tradeContract[fn](wireArgs);
+
+  const signed = await withTimeout(
+    assembled.sign({
+      signTransaction: async (xdr: string) => {
+        const { signedTxXdr, error } = await Freighter.signTransaction(xdr, {
+          networkPassphrase: config.stellarNetworkPassphrase,
+          address,
+        });
+        if (error) {
+          if (isUserDeclined(error.message)) {
+            throw new UserCancelledError();
+          }
+          throw new Error(error.message);
+        }
+        return { signedTxXdr };
+      },
+    }),
+    SIGN_TIMEOUT_MS,
+    'Freighter didn’t respond to the signing prompt — check the extension popup, or try again.',
+  );
+
+  const sent = await signed.send();
+  const txHash = sent.sendTransactionResponse?.hash ?? sent.getTransactionResponse?.txHash;
+  if (!txHash) {
+    throw new Error(
+      'Transaction was sent but no hash was returned — check your wallet history.',
+    );
+  }
+  return txHash;
+}
