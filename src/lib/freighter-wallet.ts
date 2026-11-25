@@ -66,6 +66,24 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
 const CONNECT_TIMEOUT_MS = 45_000;
 const SIGN_TIMEOUT_MS = 90_000;
 
+/**
+ * Known Stellar network passphrases mapped to their human-readable display
+ * names. The expected network comes from `config.stellarNetworkPassphrase`,
+ * which can be mainnet or futurenet as well as testnet — so the wrong-network
+ * error must name whatever network this app is actually configured for, not a
+ * hardcoded "Testnet". Unknown passphrases fall back to the raw value.
+ */
+const NETWORK_DISPLAY_NAMES: Record<string, string> = {
+  'Test SDF Network ; September 2015': 'Testnet',
+  'Public Global Stellar Network ; September 2015': 'Mainnet',
+  'Test SDF Future Network ; October 2022': 'Futurenet',
+};
+
+/** Maps a network passphrase to a display name, falling back to the raw passphrase for unknown networks. */
+export function networkDisplayName(passphrase: string): string {
+  return NETWORK_DISPLAY_NAMES[passphrase] ?? passphrase;
+}
+
 /** `false` only when the Freighter extension itself isn't installed — distinct from "installed but not yet authorized," which `connectFreighter` handles via its own prompt. */
 export async function isFreighterAvailable(): Promise<boolean> {
   const { isConnected, error } = await Freighter.isConnected();
@@ -116,8 +134,9 @@ export async function connectFreighter(): Promise<string> {
     throw new Error(netError.message);
   }
   if (networkPassphrase !== config.stellarNetworkPassphrase) {
+    const expected = networkDisplayName(config.stellarNetworkPassphrase);
     throw new Error(
-      `Freighter is set to the wrong network. Switch it to Testnet (currently: ${networkPassphrase}) and try again.`,
+      `Freighter is set to the wrong network. Switch it to ${expected} (currently: ${networkPassphrase}) and try again.`,
     );
   }
 
@@ -191,59 +210,6 @@ export async function callAsWallet(
   contractId: string,
   functionName: TradeFunction,
   args: Record<string, string | number>,
-  contractKind?: 'market' | 'perpetual',
-): Promise<{ txHash: string }> {
-  if (wallet.kind === 'email') {
-    return api.post<{ txHash: string }>('/auth/email/trade', {
-      contractId,
-      functionName,
-      args,
-      contractKind,
-    });
-  }
+  c
 
-  const { contract, rpc, TransactionBuilder, Networks } = await import('@stellar/stellar-sdk');
-  const rpcUrl = config.sorobanRpcUrl;
-  const networkPassphrase = config.stellarNetworkPassphrase;
-  const spec = await getContractSpec(contractId, rpcUrl, networkPassphrase);
-  const client = new contract.Client(spec, {
-    contractId,
-    rpcUrl,
-    networkPassphrase,
-    publicKey: wallet.address,
-    signTransaction: async (xdr: string) => {
-      const { signedTxXdr, error } = await withTimeout(
-        Freighter.signTransaction(xdr, { networkPassphrase, address: wallet.address }),
-        SIGN_TIMEOUT_MS,
-        'Freighter didn’t respond to the signing prompt — check the extension popup, or try again.',
-      );
-      if (error || !signedTxXdr) {
-        if (isUserDeclined(error?.message)) {
-          throw new UserCancelledError();
-        }
-        throw new Error(error?.message ?? 'Signing was cancelled.');
-      }
-      return { signedTxXdr, signerAddress: wallet.address };
-    },
-  });
-
-  const tradeContract = client as unknown as TradeContract;
-  const wireArgs: Record<string, unknown> = { ...args };
-  for (const field of I128_FIELDS[functionName] ?? []) {
-    if (wireArgs[field] !== undefined) {
-      wireArgs[field] = BigInt(String(wireArgs[field]));
-    }
-  }
-  const predictionField = PREDICTION_FIELD[functionName];
-  if (predictionField && wireArgs[predictionField] !== undefined) {
-    wireArgs[predictionField] = predictionScVal(String(wireArgs[predictionField]));
-  }
-  const authParam = AUTH_ADDRESS_PARAM[functionName];
-  if (authParam) {
-    wireArgs[authParam] = wallet.address;
-  }
-
-  const assembled = await tradeContract[functionName](wireArgs);
-  const sent = await assembled.signAndSend();
-  return { txHash: sent.sendTransactionResponse?.hash ?? '' };
-}
+/* … truncated 2052 chars — edit only what you need near the top … */
